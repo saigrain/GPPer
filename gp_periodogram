@@ -1,0 +1,255 @@
+#!/usr/bin/env python
+from __future__ import division, print_function, absolute_import
+import numpy as np
+import matplotlib.pyplot as pl
+from george import kernels, GP
+import pymultinest
+from time import time as clock
+import seaborn as sns
+import pandas as pd
+from argparse import ArgumentParser
+from os.path import basename, splitext, join
+from subprocess import call
+
+if __name__ == '__main__':
+    ap = ArgumentParser()
+    ap.add_argument('lcfile', type=str)
+    ap.add_argument('--in-dir', default='.', type=str)
+    ap.add_argument('--out-dir', default='.', type=str)
+    # The switches below are for Suzanne's tests with light curves
+    # from the differential rotation blind exercise
+    ap.add_argument('--dr10', action='store_true', default=False)
+    ap.add_argument('--dr3', action='store_true', default=False)
+    args = ap.parse_args()
+
+    if args.dr10 or args.dr3:
+        print('Not setup yet')
+        exit()
+    else:
+        X = np.genfromtxt(join(args.in_dir,args.lcfile)).T
+        x = X[0]
+        y = X[1]
+        e = X[2]
+        fl = splitext(basename(args.lcfile))[0]
+    # define where temporary output files will be stored
+    rn = np.random.randint(1e8)
+    base = '/tmp/multinest_{:08d}_'.format(rn)
+    print('Saving temporary files in {}*'.format(base))
+    basep = base + 'per_'
+    basea = base + 'aper_'
+    # define where final output files will be stored
+    out_base = join(args.out_dir, fl)
+    print('Saving results in {}*'.format(out_base))
+
+    # Set up MultiNest for quasi-periodic model
+    #------------------------------------------
+
+    # 1. conversion from unit hypercube to prior
+    # parameters are log variance, log_gamma, log_period and log_tau
+    # using uniform prior between -10 and 10 on log variance
+    # using uniform prior between log(0.1) and log(2.0) on log gamma
+    # using uniform prior between log(0.1) and log(100) on log period
+    # using uniform prior between log(0.2) and log(2000) on log lambda
+    def MultiNestPrior_per(cube, ndim, npar):
+        cube[0] = 10 * (cube[0] - 0.5) 
+        cube[1] = 3.0 * cube[1] - 2.3
+        cube[2] = 6.9 * cube[2] - 2.3
+        cube[3] = 8.3 * cube[3] - 0.7
+    # 2. log likelihood
+    def MultiNestLogLike_per(cube, ndim, npar):
+        var = np.exp(cube[0])
+        gamma = np.exp(cube[1])
+        log_period = cube[2]
+        period = np.exp(log_period)
+        lam = np.exp(cube[3])
+        kernel = var * \
+          kernels.ExpSine2Kernel(gamma, log_period) * \
+        kernels.ExpSquaredKernel(lam)
+        gp = GP(kernel=kernel, mean=np.mean(y))
+        gp.compute(x, yerr = e)
+        try:
+            return gp.log_likelihood(y)
+        except:
+            return -1e25
+
+    # Set up MultiNest for aperiodic model
+    #-------------------------------------
+    # 1. conversion from unit hypercube to prior
+    # parameters are log variance, log metric
+    # using uniform prior between -10 and 10 on both
+    def MultiNestPrior_aper(cube, ndim, npar):
+        cube[0] = 10 * (cube[0] - 0.5) 
+        cube[1] = 10 * (cube[1] - 0.5) 
+    # 2. log likelihood
+    def MultiNestLogLike_aper(cube, ndim, npar):
+        var = np.exp(cube[0])
+        met = np.exp(cube[1])
+        kernel = var * \
+          kernels.ExpSquaredKernel(met)
+        gp = GP(kernel=kernel, mean=np.mean(y))
+        gp.compute(x, yerr = e)
+        try:
+            return gp.log_likelihood(y)
+        except:
+            return -1e25
+
+    # Run MultiNest
+    #--------------
+    # QP model
+    t0 = clock()
+    pymultinest.run(MultiNestLogLike_per, MultiNestPrior_per, 4,
+                        outputfiles_basename = basep,
+                        resume = False, verbose = True)
+    a = pymultinest.Analyzer(n_params = 4, outputfiles_basename = basep)
+    best_fit = a.get_best_fit()['parameters']
+    best_par_orig = np.zeros(4)
+    for k in range(4):
+        best_par_orig[k] = best_fit[k]
+    samples_orig = a.get_equal_weighted_posterior()[:,:-1]
+    best_par = np.exp(best_par_orig)
+    samples = np.exp(samples_orig)
+    s = a.get_stats()
+    lnZ = s['global evidence']
+    elnZ = s['global evidence error']
+    t1 = clock()
+    ttaken = t1-t0
+    X = np.zeros((7,4))
+    print('time taken for QP MultiNest: {:d}s.'.format(int(ttaken)))
+    print('QP model: lnZ={:.3f}+/-{:.3f}'.format(lnZ, elnZ))
+    X[0,0] = lnZ
+    X[0,1] = elnZ    
+    print('QP model parameter posteriors')
+    print('\n{:20s}: {:10s} {:10s} - {:7s} + {:7s}'.format('Parameter', 'Best', \
+                                                            'Median','Error',\
+                                                               'Error'))
+    names = ['Var','Gamma', 'P', 'lambda']
+    for i in range(4):
+        val = samples[:,i].flatten()
+        b, m, f = np.percentile(val, [16,50,84])
+        par50 = m
+        par16 = b
+        par84 = f
+        print('{:20s}: {:10.5f} {:10.5f} - {:7.5f} + {:7.5f}'.format(names[i], best_par[i], m, m-b, f-m))
+        X[i+1,0] = best_par[i]
+        X[i+1,1] = m
+        X[i+1,2] = m-b
+        X[i+1,3] = f-m
+    # AP model
+    t0 = clock()
+    pymultinest.run(MultiNestLogLike_aper, MultiNestPrior_aper, 2,
+                        outputfiles_basename = basea,
+                        resume = False, verbose = True)
+    a = pymultinest.Analyzer(n_params = 2, outputfiles_basename = basea)
+    best_fit_ap = a.get_best_fit()['parameters']
+    best_par_orig_ap = np.zeros(2)
+    for k in range(2):
+        best_par_orig_ap[k] = best_fit_ap[k]
+    samples_orig_ap = a.get_equal_weighted_posterior()[:,:-1]
+    best_par_ap = np.exp(best_par_orig_ap)
+    samples_ap = np.exp(samples_orig_ap)
+    best_par_ap = np.sqrt(best_par_ap)
+    samples_ap = np.sqrt(samples_ap)
+    s = a.get_stats()
+    lnZ_ap = s['global evidence']
+    elnZ_ap = s['global evidence error']
+    X[0,2] = lnZ_ap
+    X[0,3] = elnZ_ap
+    t1 = clock()
+    ttaken_ap = t1-t0    
+    print('time taken for AP MultiNest: {:d}s.'.format(int(ttaken_ap)))
+    print('AP model: lnZ={:.3f}+/-{:.3f}'.format(lnZ_ap, elnZ_ap))
+    print('\n{:20s}: {:10s} {:10s} - {:7s} + {:7s}'.format('Parameter', 'Best', \
+                                                            'Median','Error',\
+                                                               'Error'))
+    names = ['Var','lambda']
+    for i in range(2):
+        val = samples[:,i].flatten()
+        b, m, f = np.percentile(val, [16,50,84])
+        par50 = m
+        par16 = b
+        par84 = f
+        print('{:20s}: {:10.5f} {:10.5f} - {:7.5f} + {:7.5f}'.format(names[i], best_par[i], m, m-b, f-m))
+        X[i+5,0] = best_par[i]
+        X[i+5,1] = m
+        X[i+5,2] = m-b
+        X[i+5,3] = f-m
+    np.savetxt(out_base + '_multinest_results.txt', X)
+
+    # plot marginal distributions
+    #----------------------------
+    # QP model                                        
+    print('Creating marginal plot for QP model ...')
+    labels = [r'$V$', r'$\Gamma$', r'$P$', r'$\lambda$']
+    df = pd.DataFrame(samples, columns = labels)
+    g = sns.PairGrid(df, diag_sharey=False)
+    g.map_diag(sns.kdeplot)
+    g.map_upper(pl.plot, marker='.',ms=4,alpha=0.3, linestyle='None')
+    cm = sns.light_palette('C0',as_cmap=True)
+    g.map_lower(sns.kdeplot, cmap = cm, shade=True, n_levels=6)
+    pl.tight_layout()
+    pl.savefig(out_base + '_multinest_per_marg.png')
+    pl.close()
+    
+    # AP model                                        
+    labels_ap = [r'$V$', r'$L$']
+    names_ap = ['Var','L']
+    print('Creating marginal plot for AP model...')
+    df = pd.DataFrame(samples_ap, columns = labels_ap)
+    g = sns.PairGrid(df, diag_sharey=False)
+    g.map_diag(sns.kdeplot)
+    g.map_upper(pl.plot, marker='.',ms=4,alpha=0.3, linestyle='None')
+    cm = sns.light_palette('C0',as_cmap=True)
+    g.map_lower(sns.kdeplot, cmap = cm, shade=True, n_levels=6)
+    pl.tight_layout()
+    pl.savefig(out_base + '_multinest_aper_marg.png')
+    pl.close()
+
+    # Plot best fit and posterior samples on the light curve
+    #-------------------------------------------------------
+    def plot_model(pv, plot_err = True, color = 'C0', ap = False):
+        if ap:
+            var = np.exp(pv[0])
+            met = np.exp(pv[1])
+            kernel = var * \
+            kernels.ExpSquaredKernel(met)
+        else:
+            var = np.exp(pv[0])
+            gamma = np.exp(pv[1])
+            log_period = pv[2]
+            lam = np.exp(pv[3])
+            kernel = var * \
+              kernels.ExpSine2Kernel(gamma, log_period) * \
+            kernels.ExpSquaredKernel(lam)
+        gp = GP(kernel=kernel, mean=np.mean(y))
+        gp.compute(x, yerr = e)
+        xpred = np.linspace(x.min(), x.max(), 1000)
+        if plot_err:
+            mu, var = gp.predict(y, xpred, return_var = True)
+            std = np.sqrt(var)
+            pl.fill_between(xpred, mu + 2 * std, mu - 2 * std, color = color, \
+                                alpha = 0.3, lw = 0)
+        else:
+            mu = gp.predict(y, xpred, return_cov = False)
+        pl.plot(xpred, mu, '-', color = color)
+    
+    pl.figure(figsize=(10,6))
+    pl.errorbar(x, y, yerr=e, fmt='k.')
+    pl.ylabel('flux')
+    pl.xlabel('time (days)')
+    print('\nPlotting best fit QP model')
+    plot_model(best_par_orig)
+    print('\nPlotting posterior samples')
+    l = np.random.choice(samples_orig.shape[0], 3, replace = False)
+    samples_sel = samples_orig[l,:]
+    for i in range(3):
+        pv = samples_sel[i,:].flatten()
+        plot_model(pv, plot_err = False, color = 'C1')
+    print('\nPlotting best fit AP model')
+    plot_model(best_par_orig_ap, ap = True, color = 'C2')
+    print('\nPlotting posterior samples')
+    l = np.random.choice(samples_orig_ap.shape[0], 3, replace = False)
+    samples_sel = samples_orig[l,:]
+    for i in range(3):
+        pv = samples_sel[i,:].flatten()
+        plot_model(pv, ap = True, plot_err = False, color = 'C3')
+    pl.savefig(out_base + '_multinest_lc_fit.png')
